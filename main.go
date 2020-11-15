@@ -5,6 +5,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"log"
 	"math"
@@ -21,8 +22,11 @@ var saramaKafkaProtocolVersion = sarama.V0_10_2_0
 
 type connectorConfig struct {
 	*types.ControllerConfig
-	Topics []string
-	Broker string
+	Topics       []string
+	Broker       string
+	User         string
+	Password     string
+	KafkaVersion sarama.KafkaVersion
 }
 
 const (
@@ -36,22 +40,41 @@ func main() {
 
 	controller := types.NewController(credentials, config.ControllerConfig)
 
+	kafkaConfig := getConfig(config)
+
 	controller.BeginMapBuilder()
 
 	brokers := []string{config.Broker}
-	waitForBrokers(brokers, config, controller)
+	waitForBrokers(brokers, config, kafkaConfig, controller)
 
-	makeConsumer(brokers, config, controller)
+	makeConsumer(brokers, config, kafkaConfig, controller)
 }
 
-func waitForBrokers(brokers []string, config connectorConfig, controller *types.Controller) {
+func getConfig(config connectorConfig) *sarama.Config {
+	sConfig := sarama.NewConfig()
+	sConfig.Net.DialTimeout = 10 * time.Second
+	sConfig.Net.SASL.Enable = true
+	if len(config.User) > 0 && len(config.Password) > 0 {
+		sConfig.Net.SASL.User = config.User
+		sConfig.Net.SASL.Password = config.Password
+		sConfig.Net.TLS.Enable = true
+		sConfig.Net.TLS.Config = &tls.Config{
+			InsecureSkipVerify: true,
+			ClientAuth:         0,
+		}
+	}
+	sConfig.Version = config.KafkaVersion
+	return sConfig
+}
+
+func waitForBrokers(brokers []string, config connectorConfig, kafkaConfig *sarama.Config, controller *types.Controller) {
 
 	var client sarama.Client
 	var err error
 
 	for {
 		if len(controller.Topics()) > 0 {
-			client, err = sarama.NewClient(brokers, nil)
+			client, err = sarama.NewClient(brokers, kafkaConfig)
 			if client != nil && err == nil {
 				break
 			}
@@ -65,10 +88,10 @@ func waitForBrokers(brokers []string, config connectorConfig, controller *types.
 	}
 }
 
-func makeConsumer(brokers []string, config connectorConfig, controller *types.Controller) {
+func makeConsumer(brokers []string, config connectorConfig, kafkaConfig *sarama.Config, controller *types.Controller) {
 	//setup consumer
 	cConfig := cluster.NewConfig()
-	cConfig.Version = saramaKafkaProtocolVersion
+	cConfig.Config = *kafkaConfig
 	cConfig.Consumer.Return.Errors = true
 	cConfig.Consumer.Offsets.Initial = sarama.OffsetNewest //OffsetOldest
 	cConfig.Group.Return.Notifications = true
@@ -179,6 +202,26 @@ func buildConnectorConfig() connectorConfig {
 		asynchronousInvocation = (val == "1" || val == "true")
 	}
 
+	user := ""
+	if val, exists := os.LookupEnv("user"); exists {
+		user = val
+	}
+
+	password := ""
+	if val, exists := os.LookupEnv("password"); exists {
+		password = val
+	}
+
+	kafkaVersion := sarama.V0_10_2_0
+	if val, exists := os.LookupEnv("kafka_version"); exists {
+		parsedKafkaVersion, errorVersion := sarama.ParseKafkaVersion(val)
+		if errorVersion != nil {
+			log.Fatalln("Invalid Kafka version: ", errorVersion)
+		}
+
+		kafkaVersion = parsedKafkaVersion
+	}
+
 	return connectorConfig{
 		ControllerConfig: &types.ControllerConfig{
 			UpstreamTimeout:          upstreamTimeout,
@@ -189,7 +232,10 @@ func buildConnectorConfig() connectorConfig {
 			TopicAnnotationDelimiter: delimiter,
 			AsyncFunctionInvocation:  asynchronousInvocation,
 		},
-		Topics: topics,
-		Broker: broker,
+		Topics:       topics,
+		Broker:       broker,
+		User:         user,
+		Password:     password,
+		KafkaVersion: kafkaVersion,
 	}
 }
